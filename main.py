@@ -8,6 +8,10 @@ from io import BytesIO
 import re
 import os
 
+# HEIC support (CRITICAL for iPhone photos)
+from pillow_heif import register_heif_opener
+register_heif_opener()
+
 app = FastAPI(
     title="Smart OCR with Fallback Form Extraction",
     version="1.0.0"
@@ -21,9 +25,17 @@ def load_image_from_url(url: str) -> np.ndarray:
     if resp.status_code != 200:
         raise HTTPException(status_code=400, detail="Failed to fetch image")
 
-    img = Image.open(BytesIO(resp.content))
-    img = ImageOps.exif_transpose(img)  # fix orientation
+    try:
+        img = Image.open(BytesIO(resp.content))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Unsupported image format: {str(e)}")
+
+    # Fix orientation (EXIF-aware, critical for phone photos)
+    img = ImageOps.exif_transpose(img)
+
+    # Always normalize to RGB
     img = img.convert("RGB")
+
     return np.array(img)
 
 
@@ -31,15 +43,19 @@ def load_image_from_url(url: str) -> np.ndarray:
 # Preprocessing (JPJ-safe)
 # -------------------------
 def preprocess(img: np.ndarray) -> np.ndarray:
+    # Convert to grayscale
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    # Contrast normalization (CRITICAL for JPJ pink docs)
+    # Contrast normalization (CRITICAL for JPJ pink / faded docs)
     gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
 
-    # Noise reduction without killing text
+    # Noise reduction without destroying text edges
     gray = cv2.bilateralFilter(gray, 9, 75, 75)
 
-    # Adaptive threshold handles photos + scans
+    # Adaptive threshold works for:
+    # - scanned docs
+    # - phone photos
+    # - uneven lighting
     thresh = cv2.adaptiveThreshold(
         gray,
         255,
@@ -48,6 +64,7 @@ def preprocess(img: np.ndarray) -> np.ndarray:
         31,
         2
     )
+
     return thresh
 
 
@@ -68,11 +85,15 @@ def run_ocr(img: np.ndarray) -> str:
 def classify_jpj(text: str):
     text_upper = text.upper()
 
+    # Hard gate: must look like JPJ road tax
     if "LESEN KENDERAAN MOTOR" not in text_upper:
         return None
 
     plate = re.search(r"\b[A-Z]{1,3}\d{1,4}[A-Z]?\b", text_upper)
-    expiry = re.search(r"\b\d{2}\s(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s\d{4}\b", text_upper)
+    expiry = re.search(
+        r"\b\d{2}\s(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s\d{4}\b",
+        text_upper
+    )
     amount = re.search(r"RM\s?\d+(?:\.\d{2})?", text_upper)
     receipt = re.search(r"\bVEL\d{5}\b", text_upper)
 
@@ -82,6 +103,7 @@ def classify_jpj(text: str):
     elif "SELAIN MOTOSIKAL" in text_upper:
         vehicle_class = "SELAIN MOTOSIKAL"
 
+    # Confidence scoring (explicit, interpretable)
     confidence = 0.0
     confidence += 0.3 if plate else 0
     confidence += 0.3 if expiry else 0
@@ -148,5 +170,6 @@ def ocr_document(payload: dict):
 def check_tesseract():
     langs = pytesseract.get_languages(config="")
     print("Available Tesseract languages:", langs)
+
     if "msa" not in langs:
         print("WARNING: Malay language pack (msa) missing!")
