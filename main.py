@@ -9,6 +9,10 @@ import re
 import os
 import math
 
+# HEIC support (CRITICAL)
+import pillow_heif
+pillow_heif.register_heif_opener()
+
 app = FastAPI(
     title="Smart OCR with Photo-First Pipeline (Malaysia)",
     version="2.0.0"
@@ -22,7 +26,11 @@ def load_image_from_url(url: str) -> np.ndarray:
     if resp.status_code != 200:
         raise HTTPException(status_code=400, detail="Failed to fetch image")
 
-    img = Image.open(BytesIO(resp.content))
+    try:
+        img = Image.open(BytesIO(resp.content))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Image decode failed: {str(e)}")
+
     img = ImageOps.exif_transpose(img)
     img = img.convert("RGB")
     return np.array(img)
@@ -34,20 +42,16 @@ def load_image_from_url(url: str) -> np.ndarray:
 def enhance_photo(img: np.ndarray) -> np.ndarray:
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    # Contrast Limited Adaptive Histogram Equalization (CRITICAL)
     clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
     gray = clahe.apply(gray)
 
-    # Shadow lift
     gray = cv2.normalize(gray, None, 30, 255, cv2.NORM_MINMAX)
 
-    # Sharpen text edges
     kernel = np.array([[0, -1, 0],
                        [-1, 5, -1],
                        [0, -1, 0]])
     gray = cv2.filter2D(gray, -1, kernel)
 
-    # Gentle denoise (do NOT destroy characters)
     gray = cv2.fastNlMeansDenoising(gray, h=10)
 
     return gray
@@ -65,7 +69,7 @@ def run_ocr(img: np.ndarray) -> str:
 
 
 # -------------------------------------------------
-# OCR quality estimator (photo tolerant)
+# OCR quality estimator
 # -------------------------------------------------
 def ocr_quality(text: str) -> float:
     if not text.strip():
@@ -87,7 +91,7 @@ def ocr_quality(text: str) -> float:
 
 
 # -------------------------------------------------
-# Malaysia JPJ Road Tax Classifier (PHOTO SAFE)
+# Malaysia JPJ classifier
 # -------------------------------------------------
 def classify_jpj(text: str):
     t = text.upper()
@@ -131,7 +135,7 @@ def classify_jpj(text: str):
 
 
 # -------------------------------------------------
-# Safe fallback extractor (NO hallucination)
+# Safe fallback
 # -------------------------------------------------
 def fallback_form_extraction(text: str, quality: float):
     if quality < 0.4:
@@ -164,7 +168,7 @@ def fallback_form_extraction(text: str, quality: float):
 
 
 # -------------------------------------------------
-# API Endpoint
+# API endpoint
 # -------------------------------------------------
 @app.post("/ocr/document")
 def ocr_document(payload: dict):
@@ -174,24 +178,20 @@ def ocr_document(payload: dict):
 
     img = load_image_from_url(image_url)
 
-    # Dual-path OCR
     raw_text = run_ocr(img)
     enhanced_img = enhance_photo(img)
     enhanced_text = run_ocr(enhanced_img)
 
-    # Choose better OCR output
     raw_q = ocr_quality(raw_text)
     enh_q = ocr_quality(enhanced_text)
 
     text = enhanced_text if enh_q >= raw_q else raw_text
     quality = max(raw_q, enh_q)
 
-    # Attempt JPJ classification
     jpj = classify_jpj(text)
     if jpj:
         return jpj
 
-    # Fallback
     return fallback_form_extraction(text, quality)
 
 
