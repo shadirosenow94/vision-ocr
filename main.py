@@ -1,4 +1,5 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.responses import JSONResponse
 import pytesseract
 import cv2
 import numpy as np
@@ -6,9 +7,12 @@ import requests
 from PIL import Image, ImageOps
 from io import BytesIO
 import re
-from concurrent.futures import ThreadPoolExecutor, TimeoutError
+import uuid
+from datetime import datetime, timedelta
+from typing import Optional, Dict
 import asyncio
 from functools import partial
+from concurrent.futures import ThreadPoolExecutor
 
 # HEIC support (CRITICAL)
 import pillow_heif
@@ -16,92 +20,107 @@ pillow_heif.register_heif_opener()
 
 app = FastAPI(
     title="Smart OCR with Photo-First Pipeline (Malaysia)",
-    version="2.1.0"
+    version="3.0.0"
 )
 
-# Executor for CPU-bound tasks
-executor = ThreadPoolExecutor(max_workers=2)
+# In-memory job storage (use Redis/DB in production)
+jobs: Dict[str, dict] = {}
+executor = ThreadPoolExecutor(max_workers=3)
+
+# Job cleanup every hour
+async def cleanup_old_jobs():
+    while True:
+        await asyncio.sleep(3600)
+        cutoff = datetime.now() - timedelta(hours=24)
+        to_delete = [
+            job_id for job_id, job in jobs.items()
+            if job.get('created_at', datetime.now()) < cutoff
+        ]
+        for job_id in to_delete:
+            del jobs[job_id]
+        print(f"Cleaned up {len(to_delete)} old jobs")
+
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(cleanup_old_jobs())
+    check_tesseract()
 
 # -------------------------------------------------
-# Image loader with size limits and timeout
+# Image loader with aggressive optimization
 # -------------------------------------------------
-def load_image_from_url(url: str, max_size_mb: int = 10) -> np.ndarray:
+def load_image_from_url(url: str, max_size_mb: int = 15) -> np.ndarray:
     try:
-        resp = requests.get(url, timeout=30, stream=True)
+        print(f"Downloading image from: {url}")
+        resp = requests.get(url, timeout=60, stream=True)
         if resp.status_code != 200:
-            raise HTTPException(status_code=400, detail="Failed to fetch image")
+            raise Exception(f"Failed to fetch image: {resp.status_code}")
 
-        # Check content length
         content_length = resp.headers.get('content-length')
         if content_length and int(content_length) > max_size_mb * 1024 * 1024:
-            raise HTTPException(status_code=400, detail=f"Image too large (max {max_size_mb}MB)")
+            raise Exception(f"Image too large (max {max_size_mb}MB)")
 
-        # Load image
         content = resp.content
+        print(f"Downloaded {len(content)} bytes")
+        
         img = Image.open(BytesIO(content))
+        print(f"Image format: {img.format}, size: {img.size}, mode: {img.mode}")
         
     except requests.Timeout:
-        raise HTTPException(status_code=408, detail="Image download timeout")
+        raise Exception("Image download timeout")
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Image decode failed: {str(e)}")
+        raise Exception(f"Image decode failed: {str(e)}")
 
     # Handle orientation
     img = ImageOps.exif_transpose(img)
     img = img.convert("RGB")
     
-    # Resize if too large (OCR doesn't need huge images)
-    max_dimension = 2000
+    # AGGRESSIVE resize for OCR (OCR doesn't need huge images)
+    # Target: 1200px on longest side
+    max_dimension = 1200
     if max(img.size) > max_dimension:
         ratio = max_dimension / max(img.size)
         new_size = tuple(int(dim * ratio) for dim in img.size)
         img = img.resize(new_size, Image.Resampling.LANCZOS)
-        print(f"Resized image from {img.size} to {new_size}")
+        print(f"Resized image to {new_size}")
     
     return np.array(img)
 
 
 # -------------------------------------------------
-# Photo-first enhancement pipeline (optimized)
+# Lightweight enhancement
 # -------------------------------------------------
 def enhance_photo(img: np.ndarray) -> np.ndarray:
-    """Lighter enhancement pipeline for faster processing"""
+    """Super lightweight enhancement for speed"""
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-    # Adaptive histogram equalization (lighter)
+    
+    # Just CLAHE + light sharpen
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     gray = clahe.apply(gray)
-
-    # Normalize
-    gray = cv2.normalize(gray, None, 30, 255, cv2.NORM_MINMAX)
-
-    # Sharpen (lighter kernel)
-    kernel = np.array([[-1, -1, -1],
-                       [-1,  9, -1],
-                       [-1, -1, -1]]) / 1.5
-    gray = cv2.filter2D(gray, -1, kernel)
-
+    
+    # Simple unsharp mask
+    blur = cv2.GaussianBlur(gray, (3, 3), 0)
+    gray = cv2.addWeighted(gray, 1.5, blur, -0.5, 0)
+    
     return gray
 
 
 # -------------------------------------------------
-# OCR runner with timeout
+# OCR runner (no timeout - let it finish)
 # -------------------------------------------------
-def run_ocr(img: np.ndarray, timeout: int = 30) -> str:
-    """Run OCR with timeout protection"""
+def run_ocr(img: np.ndarray) -> str:
+    """Run OCR without timeout - runs in background"""
     try:
-        # Run in thread pool with timeout
-        future = executor.submit(
-            pytesseract.image_to_string,
+        print(f"Starting OCR on image shape: {img.shape}")
+        result = pytesseract.image_to_string(
             img,
             lang="eng+msa",
             config="--oem 3 --psm 6"
         )
-        result = future.result(timeout=timeout)
+        print(f"OCR completed, extracted {len(result)} characters")
         return result
-    except TimeoutError:
-        raise HTTPException(status_code=504, detail="OCR processing timeout")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"OCR failed: {str(e)}")
+        print(f"OCR error: {e}")
+        raise Exception(f"OCR failed: {str(e)}")
 
 
 # -------------------------------------------------
@@ -127,19 +146,18 @@ def ocr_quality(text: str) -> float:
 
 
 # -------------------------------------------------
-# Enhanced Malaysia JPJ classifier with better patterns
+# Enhanced Malaysia JPJ classifier
 # -------------------------------------------------
 def classify_jpj(text: str):
     t = text.upper()
     
-    # More flexible document identification
     has_lesen = "LESEN" in t
     has_kenderaan = "KENDERAAN" in t or "MOTOR" in t
     
     if not (has_lesen or has_kenderaan):
         return None
 
-    # Enhanced plate number pattern (more flexible)
+    # Plate patterns
     plate_patterns = [
         r"\b[A-Z]{2,4}\s?\d{3,4}\s?[A-Z]?\b",
         r"(?:^|\n)([A-Z]{2,4}\s?\d{3,4})(?:\s|$)",
@@ -152,7 +170,7 @@ def classify_jpj(text: str):
             plate = re.sub(r'\s+', '', plate)
             break
     
-    # Enhanced expiry date pattern
+    # Expiry date
     expiry_patterns = [
         r"\b(\d{1,2})\s*(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s*(\d{4})\b",
         r"\b(\d{1,2})(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)(\d{4})\b"
@@ -165,35 +183,32 @@ def classify_jpj(text: str):
             expiry = f"{day.zfill(2)} {month} {year}"
             break
     
-    # Amount pattern
+    # Amount
     amount_match = re.search(r"RM\s?(\d+(?:\.\d{2})?)", t)
     amount = f"RM{amount_match.group(1)}" if amount_match else None
     
-    # Receipt/Reference codes
-    receipt_patterns = [
-        r"\bVEL\d{5,}\b",
-        r"\b\d{7,}\b"
-    ]
+    # Receipt codes
+    receipt_patterns = [r"\bVEL\d{5,}\b", r"\b\d{7,}\b"]
     receipts = []
     for pattern in receipt_patterns:
         matches = re.findall(pattern, t)
         receipts.extend(matches)
     
-    # Vehicle class detection
+    # Vehicle class
     vehicle_class = None
     if "MOTOSIKAL" in t and "SELAIN" not in t:
         vehicle_class = "MOTOSIKAL"
     elif "SELAIN MOTOSIKAL" in t or "SELAIN MOTO" in t:
         vehicle_class = "SELAIN MOTOSIKAL"
     
-    # Location extraction
+    # Location
     location = None
     if "SEMENANJUNG" in t:
         location = "SEMENANJUNG"
     elif "PERSENDIRIAN" in t:
         location = "PERSENDIRIAN"
     
-    # Build confidence score
+    # Confidence
     confidence = 0.0
     confidence += 0.3 if has_lesen or has_kenderaan else 0
     confidence += 0.3 if plate else 0
@@ -222,15 +237,14 @@ def classify_jpj(text: str):
 
 
 # -------------------------------------------------
-# Safe fallback
+# Fallback
 # -------------------------------------------------
 def fallback_form_extraction(text: str, quality: float):
     if quality < 0.3:
         return {
             "document_type": "unreadable",
             "confidence": 0.0,
-            "reason": "Photo quality too low for structured extraction",
-            "suggestion": "Retake photo with better lighting or closer framing",
+            "reason": "Photo quality too low",
             "quality_score": quality
         }
 
@@ -245,8 +259,7 @@ def fallback_form_extraction(text: str, quality: float):
         return {
             "document_type": "unknown_form",
             "confidence": round(quality, 2),
-            "note": "Text detected but structure unclear",
-            "text_preview": text[:300] if len(text) > 300 else text
+            "note": "Text detected but structure unclear"
         }
 
     return {
@@ -257,95 +270,176 @@ def fallback_form_extraction(text: str, quality: float):
 
 
 # -------------------------------------------------
-# API endpoint (async with timeout)
+# Background OCR processor
+# -------------------------------------------------
+def process_ocr_job(job_id: str, image_url: str):
+    """Process OCR in background - NO TIMEOUTS"""
+    try:
+        jobs[job_id]['status'] = 'processing'
+        jobs[job_id]['updated_at'] = datetime.now()
+        
+        # Load image
+        print(f"Job {job_id}: Loading image")
+        img = load_image_from_url(image_url)
+        
+        # Try raw OCR first
+        print(f"Job {job_id}: Running raw OCR")
+        raw_text = run_ocr(img)
+        raw_q = ocr_quality(raw_text)
+        print(f"Job {job_id}: Raw quality {raw_q}")
+        
+        # Try classification
+        jpj = classify_jpj(raw_text)
+        if jpj and jpj['confidence'] > 0.6:
+            print(f"Job {job_id}: Classified from raw OCR")
+            jpj["ocr_quality"] = raw_q
+            jpj["method"] = "raw"
+            jobs[job_id]['status'] = 'completed'
+            jobs[job_id]['result'] = jpj
+            jobs[job_id]['updated_at'] = datetime.now()
+            return
+        
+        # Try enhanced
+        print(f"Job {job_id}: Running enhanced OCR")
+        enhanced_img = enhance_photo(img)
+        enhanced_text = run_ocr(enhanced_img)
+        enh_q = ocr_quality(enhanced_text)
+        print(f"Job {job_id}: Enhanced quality {enh_q}")
+        
+        # Try classification on enhanced
+        jpj = classify_jpj(enhanced_text)
+        if jpj:
+            print(f"Job {job_id}: Classified from enhanced OCR")
+            jpj["ocr_quality"] = enh_q
+            jpj["method"] = "enhanced"
+            jobs[job_id]['status'] = 'completed'
+            jobs[job_id]['result'] = jpj
+            jobs[job_id]['updated_at'] = datetime.now()
+            return
+        
+        # Fallback
+        text = enhanced_text if enh_q >= raw_q else raw_text
+        quality = max(raw_q, enh_q)
+        result = fallback_form_extraction(text, quality)
+        
+        jobs[job_id]['status'] = 'completed'
+        jobs[job_id]['result'] = result
+        jobs[job_id]['updated_at'] = datetime.now()
+        print(f"Job {job_id}: Completed with fallback")
+        
+    except Exception as e:
+        print(f"Job {job_id}: Failed - {e}")
+        jobs[job_id]['status'] = 'failed'
+        jobs[job_id]['error'] = str(e)
+        jobs[job_id]['updated_at'] = datetime.now()
+
+
+# -------------------------------------------------
+# API: Submit job (instant response)
 # -------------------------------------------------
 @app.post("/ocr/document")
-async def ocr_document(payload: dict):
+async def submit_ocr_job(payload: dict, background_tasks: BackgroundTasks):
+    """Submit OCR job - returns immediately with job_id"""
     image_url = payload.get("image_url")
     if not image_url:
         raise HTTPException(status_code=400, detail="image_url required")
-
-    print(f"Processing image: {image_url}")
     
-    # Load image (with timeout and size limit)
-    try:
-        img = await asyncio.get_event_loop().run_in_executor(
-            executor,
-            partial(load_image_from_url, image_url)
-        )
-        print(f"Image loaded: {img.shape}")
-    except Exception as e:
-        print(f"Image load failed: {e}")
-        raise
-
-    # Strategy: Try raw first (faster), only enhance if needed
-    print("Running raw OCR...")
-    try:
-        raw_text = await asyncio.get_event_loop().run_in_executor(
-            executor,
-            partial(run_ocr, img, 30)
-        )
-        raw_q = ocr_quality(raw_text)
-        print(f"Raw OCR quality: {raw_q}")
-    except Exception as e:
-        print(f"Raw OCR failed: {e}")
-        raise
-
-    # Try classification on raw first
-    jpj = classify_jpj(raw_text)
-    if jpj and jpj['confidence'] > 0.6:
-        print("Document classified from raw OCR")
-        jpj["ocr_quality"] = raw_q
-        jpj["method"] = "raw"
-        return jpj
-
-    # If raw wasn't confident enough, try enhanced
-    print("Raw OCR insufficient, trying enhanced...")
-    try:
-        enhanced_img = await asyncio.get_event_loop().run_in_executor(
-            executor,
-            partial(enhance_photo, img)
-        )
-        enhanced_text = await asyncio.get_event_loop().run_in_executor(
-            executor,
-            partial(run_ocr, enhanced_img, 30)
-        )
-        enh_q = ocr_quality(enhanced_text)
-        print(f"Enhanced OCR quality: {enh_q}")
-    except Exception as e:
-        print(f"Enhanced OCR failed: {e}")
-        # Fall back to raw results
-        return fallback_form_extraction(raw_text, raw_q)
-
-    # Try classification on enhanced
-    jpj = classify_jpj(enhanced_text)
-    if jpj:
-        print("Document classified from enhanced OCR")
-        jpj["ocr_quality"] = enh_q
-        jpj["method"] = "enhanced"
-        return jpj
-
-    # Use better of the two
-    text = enhanced_text if enh_q >= raw_q else raw_text
-    quality = max(raw_q, enh_q)
+    # Create job
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = {
+        "job_id": job_id,
+        "status": "queued",
+        "image_url": image_url,
+        "created_at": datetime.now(),
+        "updated_at": datetime.now()
+    }
     
-    print(f"No JPJ classification, falling back. Quality: {quality}")
-    return fallback_form_extraction(text, quality)
+    # Start processing in background
+    background_tasks.add_task(process_ocr_job, job_id, image_url)
+    
+    return {
+        "job_id": job_id,
+        "status": "queued",
+        "message": "OCR job submitted. Poll /ocr/status/{job_id} for results",
+        "status_url": f"/ocr/status/{job_id}"
+    }
+
+
+# -------------------------------------------------
+# API: Check job status
+# -------------------------------------------------
+@app.get("/ocr/status/{job_id}")
+async def get_job_status(job_id: str):
+    """Get OCR job status and results"""
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    job = jobs[job_id]
+    
+    response = {
+        "job_id": job_id,
+        "status": job['status'],
+        "created_at": job['created_at'].isoformat(),
+        "updated_at": job['updated_at'].isoformat()
+    }
+    
+    if job['status'] == 'completed':
+        response['result'] = job.get('result')
+    elif job['status'] == 'failed':
+        response['error'] = job.get('error')
+    
+    return response
+
+
+# -------------------------------------------------
+# API: Synchronous endpoint (with longer timeout)
+# -------------------------------------------------
+@app.post("/ocr/document/sync")
+async def ocr_document_sync(payload: dict):
+    """Synchronous OCR - waits up to 90s for result"""
+    image_url = payload.get("image_url")
+    if not image_url:
+        raise HTTPException(status_code=400, detail="image_url required")
+    
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = {
+        "job_id": job_id,
+        "status": "queued",
+        "image_url": image_url,
+        "created_at": datetime.now(),
+        "updated_at": datetime.now()
+    }
+    
+    # Run in executor
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(executor, process_ocr_job, job_id, image_url)
+    
+    # Wait for completion (up to 90s)
+    for _ in range(180):  # 180 * 0.5s = 90s
+        await asyncio.sleep(0.5)
+        if jobs[job_id]['status'] in ['completed', 'failed']:
+            break
+    
+    job = jobs[job_id]
+    
+    if job['status'] == 'completed':
+        return job['result']
+    elif job['status'] == 'failed':
+        raise HTTPException(status_code=500, detail=job.get('error'))
+    else:
+        raise HTTPException(status_code=504, detail="Processing timeout - use async endpoint")
 
 
 @app.get("/health")
 def health_check():
     return {
         "status": "healthy",
-        "version": "2.1.0",
-        "tesseract_version": pytesseract.get_tesseract_version()
+        "version": "3.0.0",
+        "active_jobs": len([j for j in jobs.values() if j['status'] == 'processing']),
+        "queued_jobs": len([j for j in jobs.values() if j['status'] == 'queued'])
     }
 
 
-# -------------------------------------------------
-# Startup sanity check
-# -------------------------------------------------
-@app.on_event("startup")
 def check_tesseract():
     langs = pytesseract.get_languages(config="")
     print("Available Tesseract languages:", langs)
