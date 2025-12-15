@@ -1,8 +1,8 @@
 fastapi
 uvicorn
-pytesseract
-opencv-python-headless
-numpy
-Pillow
 requests
+pillow
 pillow-heif
+opencv-python-headless
+pytesseract
+numpy

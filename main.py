@@ -87,6 +87,63 @@ def load_image_from_url(url: str, max_size_mb: int = 15) -> np.ndarray:
 
 
 # -------------------------------------------------
+# Auto-rotation and deskewing
+# -------------------------------------------------
+def auto_rotate_image(img: np.ndarray) -> np.ndarray:
+    """Detect and correct image rotation"""
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
+    
+    # Use Tesseract's OSD (Orientation and Script Detection)
+    try:
+        osd = pytesseract.image_to_osd(gray)
+        rotation = int(re.search(r'Rotate: (\d+)', osd).group(1))
+        
+        if rotation != 0:
+            print(f"Auto-rotating image by {rotation} degrees")
+            # Rotate to correct orientation
+            if rotation == 90:
+                img = cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
+            elif rotation == 180:
+                img = cv2.rotate(img, cv2.ROTATE_180)
+            elif rotation == 270:
+                img = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
+    except Exception as e:
+        print(f"Could not detect rotation: {e}")
+    
+    return img
+
+
+def deskew_image(img: np.ndarray) -> np.ndarray:
+    """Correct slight skew/angle in image"""
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
+    
+    # Detect edges
+    edges = cv2.Canny(gray, 50, 150, apertureSize=3)
+    
+    # Detect lines using Hough transform
+    lines = cv2.HoughLines(edges, 1, np.pi / 180, 200)
+    
+    if lines is not None and len(lines) > 0:
+        # Calculate average angle
+        angles = []
+        for rho, theta in lines[:20, 0]:  # Use top 20 lines
+            angle = (theta * 180 / np.pi) - 90
+            angles.append(angle)
+        
+        median_angle = np.median(angles)
+        
+        # Only correct if angle is significant but not too extreme
+        if abs(median_angle) > 0.5 and abs(median_angle) < 45:
+            print(f"Deskewing by {median_angle:.2f} degrees")
+            h, w = img.shape[:2]
+            center = (w // 2, h // 2)
+            M = cv2.getRotationMatrix2D(center, median_angle, 1.0)
+            img = cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+    
+    return img
+
+
+# -------------------------------------------------
 # Lightweight enhancement
 # -------------------------------------------------
 def enhance_photo(img: np.ndarray) -> np.ndarray:
@@ -272,7 +329,7 @@ def fallback_form_extraction(text: str, quality: float):
 # -------------------------------------------------
 # Background OCR processor
 # -------------------------------------------------
-def process_ocr_job(job_id: str, image_url: str):
+def process_ocr_job(job_id: str, image_url: str, text_only: bool = False):
     """Process OCR in background - NO TIMEOUTS"""
     try:
         jobs[job_id]['status'] = 'processing'
@@ -282,16 +339,32 @@ def process_ocr_job(job_id: str, image_url: str):
         print(f"Job {job_id}: Loading image")
         img = load_image_from_url(image_url)
         
-        # Try raw OCR first
-        print(f"Job {job_id}: Running raw OCR")
-        raw_text = run_ocr(img)
-        raw_q = ocr_quality(raw_text)
-        print(f"Job {job_id}: Raw quality {raw_q}")
+        # Auto-rotate if needed
+        img = auto_rotate_image(img)
+        
+        # Deskew if angled
+        img = deskew_image(img)
+        
+        # Run OCR
+        print(f"Job {job_id}: Running OCR")
+        text = run_ocr(img)
+        
+        # If text_only mode, return just the text
+        if text_only:
+            jobs[job_id]['status'] = 'completed'
+            jobs[job_id]['result'] = {"text": text.strip()}
+            jobs[job_id]['updated_at'] = datetime.now()
+            print(f"Job {job_id}: Completed (text only)")
+            return
+        
+        # Otherwise, do full processing
+        raw_q = ocr_quality(text)
+        print(f"Job {job_id}: OCR quality {raw_q}")
         
         # Try classification
-        jpj = classify_jpj(raw_text)
+        jpj = classify_jpj(text)
         if jpj and jpj['confidence'] > 0.6:
-            print(f"Job {job_id}: Classified from raw OCR")
+            print(f"Job {job_id}: Classified from OCR")
             jpj["ocr_quality"] = raw_q
             jpj["method"] = "raw"
             jobs[job_id]['status'] = 'completed'
@@ -300,7 +373,7 @@ def process_ocr_job(job_id: str, image_url: str):
             return
         
         # Try enhanced
-        print(f"Job {job_id}: Running enhanced OCR")
+        print(f"Job {job_id}: Trying enhanced OCR")
         enhanced_img = enhance_photo(img)
         enhanced_text = run_ocr(enhanced_img)
         enh_q = ocr_quality(enhanced_text)
@@ -318,9 +391,9 @@ def process_ocr_job(job_id: str, image_url: str):
             return
         
         # Fallback
-        text = enhanced_text if enh_q >= raw_q else raw_text
+        best_text = enhanced_text if enh_q >= raw_q else text
         quality = max(raw_q, enh_q)
-        result = fallback_form_extraction(text, quality)
+        result = fallback_form_extraction(best_text, quality)
         
         jobs[job_id]['status'] = 'completed'
         jobs[job_id]['result'] = result
@@ -355,12 +428,44 @@ async def submit_ocr_job(payload: dict, background_tasks: BackgroundTasks):
     }
     
     # Start processing in background
-    background_tasks.add_task(process_ocr_job, job_id, image_url)
+    background_tasks.add_task(process_ocr_job, job_id, image_url, False)
     
     return {
         "job_id": job_id,
         "status": "queued",
         "message": "OCR job submitted. Poll /ocr/status/{job_id} for results",
+        "status_url": f"/ocr/status/{job_id}"
+    }
+
+
+# -------------------------------------------------
+# API: Text-only extraction (no structure)
+# -------------------------------------------------
+@app.post("/ocr/text")
+async def submit_text_ocr_job(payload: dict, background_tasks: BackgroundTasks):
+    """Submit text-only OCR job - just extracts raw text"""
+    image_url = payload.get("image_url")
+    if not image_url:
+        raise HTTPException(status_code=400, detail="image_url required")
+    
+    # Create job
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = {
+        "job_id": job_id,
+        "status": "queued",
+        "image_url": image_url,
+        "text_only": True,
+        "created_at": datetime.now(),
+        "updated_at": datetime.now()
+    }
+    
+    # Start processing in background (text_only=True)
+    background_tasks.add_task(process_ocr_job, job_id, image_url, True)
+    
+    return {
+        "job_id": job_id,
+        "status": "queued",
+        "message": "Text extraction job submitted. Poll /ocr/status/{job_id} for results",
         "status_url": f"/ocr/status/{job_id}"
     }
 

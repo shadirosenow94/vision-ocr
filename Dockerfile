@@ -5,13 +5,11 @@ RUN apt-get update && apt-get install -y \
     tesseract-ocr \
     tesseract-ocr-eng \
     tesseract-ocr-msa \
-    tesseract-ocr-osd \
     libgl1 \
-    libheif-dev \
     libglib2.0-0 \
+    libheif1 \
+    libheif-dev \
     && rm -rf /var/lib/apt/lists/*
-
-    
 
 # Ensure consistent OCR language behavior
 ENV LANG=C.UTF-8
