@@ -214,20 +214,34 @@ def classify_jpj(text: str):
     if not (has_lesen or has_kenderaan):
         return None
 
-    # Plate patterns
+    # Enhanced plate number pattern - MUST NOT be a date
+    # Malaysian plates: ABC1234, WRU7352, V1234, etc.
+    # Exclude patterns that look like dates (03 JAN 2025, JAN2025, etc.)
     plate_patterns = [
-        r"\b[A-Z]{2,4}\s?\d{3,4}\s?[A-Z]?\b",
-        r"(?:^|\n)([A-Z]{2,4}\s?\d{3,4})(?:\s|$)",
+        r"\b[A-Z]{1,3}\d{1,4}[A-Z]?\b",  # Standard format: 1-3 letters, then digits
     ]
-    plate = None
-    for pattern in plate_patterns:
-        match = re.search(pattern, t)
-        if match:
-            plate = match.group(0).strip()
-            plate = re.sub(r'\s+', '', plate)
-            break
     
-    # Expiry date
+    plate = None
+    plate_candidates = []
+    
+    for pattern in plate_patterns:
+        matches = re.findall(pattern, t)
+        for match in matches:
+            # Filter out date-like patterns
+            if re.match(r"(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\d{4}", match):
+                continue  # This is a date, not a plate
+            if match.startswith(('RM', 'VEL')):
+                continue  # This is money or receipt code
+            # Valid plate should have at least 1 letter and 1 digit
+            if re.search(r'[A-Z]', match) and re.search(r'\d', match):
+                plate_candidates.append(match)
+    
+    # Prefer plates that appear near "LESEN" or at the start/middle of text
+    if plate_candidates:
+        # Simple heuristic: choose the first valid candidate
+        plate = plate_candidates[0]
+    
+    # Enhanced expiry date pattern
     expiry_patterns = [
         r"\b(\d{1,2})\s*(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s*(\d{4})\b",
         r"\b(\d{1,2})(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)(\d{4})\b"
@@ -240,7 +254,7 @@ def classify_jpj(text: str):
             expiry = f"{day.zfill(2)} {month} {year}"
             break
     
-    # Amount
+    # Amount pattern
     amount_match = re.search(r"RM\s?(\d+(?:\.\d{2})?)", t)
     amount = f"RM{amount_match.group(1)}" if amount_match else None
     
