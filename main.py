@@ -6,7 +6,9 @@ import requests
 from PIL import Image, ImageOps
 from io import BytesIO
 import re
-from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
+import asyncio
+from functools import partial
 
 # HEIC support (CRITICAL)
 import pillow_heif
@@ -17,54 +19,89 @@ app = FastAPI(
     version="2.1.0"
 )
 
-# -------------------------------------------------
-# Image loader (HEIC-safe + orientation safe)
-# -------------------------------------------------
-def load_image_from_url(url: str) -> np.ndarray:
-    resp = requests.get(url, timeout=20)
-    if resp.status_code != 200:
-        raise HTTPException(status_code=400, detail="Failed to fetch image")
+# Executor for CPU-bound tasks
+executor = ThreadPoolExecutor(max_workers=2)
 
+# -------------------------------------------------
+# Image loader with size limits and timeout
+# -------------------------------------------------
+def load_image_from_url(url: str, max_size_mb: int = 10) -> np.ndarray:
     try:
-        img = Image.open(BytesIO(resp.content))
+        resp = requests.get(url, timeout=30, stream=True)
+        if resp.status_code != 200:
+            raise HTTPException(status_code=400, detail="Failed to fetch image")
+
+        # Check content length
+        content_length = resp.headers.get('content-length')
+        if content_length and int(content_length) > max_size_mb * 1024 * 1024:
+            raise HTTPException(status_code=400, detail=f"Image too large (max {max_size_mb}MB)")
+
+        # Load image
+        content = resp.content
+        img = Image.open(BytesIO(content))
+        
+    except requests.Timeout:
+        raise HTTPException(status_code=408, detail="Image download timeout")
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Image decode failed: {str(e)}")
 
+    # Handle orientation
     img = ImageOps.exif_transpose(img)
     img = img.convert("RGB")
+    
+    # Resize if too large (OCR doesn't need huge images)
+    max_dimension = 2000
+    if max(img.size) > max_dimension:
+        ratio = max_dimension / max(img.size)
+        new_size = tuple(int(dim * ratio) for dim in img.size)
+        img = img.resize(new_size, Image.Resampling.LANCZOS)
+        print(f"Resized image from {img.size} to {new_size}")
+    
     return np.array(img)
 
 
 # -------------------------------------------------
-# Photo-first enhancement pipeline
+# Photo-first enhancement pipeline (optimized)
 # -------------------------------------------------
 def enhance_photo(img: np.ndarray) -> np.ndarray:
+    """Lighter enhancement pipeline for faster processing"""
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+    # Adaptive histogram equalization (lighter)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     gray = clahe.apply(gray)
 
+    # Normalize
     gray = cv2.normalize(gray, None, 30, 255, cv2.NORM_MINMAX)
 
-    kernel = np.array([[0, -1, 0],
-                       [-1, 5, -1],
-                       [0, -1, 0]])
+    # Sharpen (lighter kernel)
+    kernel = np.array([[-1, -1, -1],
+                       [-1,  9, -1],
+                       [-1, -1, -1]]) / 1.5
     gray = cv2.filter2D(gray, -1, kernel)
-
-    gray = cv2.fastNlMeansDenoising(gray, h=10)
 
     return gray
 
 
 # -------------------------------------------------
-# OCR runner
+# OCR runner with timeout
 # -------------------------------------------------
-def run_ocr(img: np.ndarray) -> str:
-    return pytesseract.image_to_string(
-        img,
-        lang="eng+msa",
-        config="--oem 3 --psm 6"
-    )
+def run_ocr(img: np.ndarray, timeout: int = 30) -> str:
+    """Run OCR with timeout protection"""
+    try:
+        # Run in thread pool with timeout
+        future = executor.submit(
+            pytesseract.image_to_string,
+            img,
+            lang="eng+msa",
+            config="--oem 3 --psm 6"
+        )
+        result = future.result(timeout=timeout)
+        return result
+    except TimeoutError:
+        raise HTTPException(status_code=504, detail="OCR processing timeout")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"OCR failed: {str(e)}")
 
 
 # -------------------------------------------------
@@ -103,22 +140,19 @@ def classify_jpj(text: str):
         return None
 
     # Enhanced plate number pattern (more flexible)
-    # Matches: WRU7352, WRU 7352, ABC1234, etc.
     plate_patterns = [
-        r"\b[A-Z]{2,4}\s?\d{3,4}\s?[A-Z]?\b",  # Standard format
-        r"(?:^|\n)([A-Z]{2,4}\s?\d{3,4})(?:\s|$)",  # Line-based
+        r"\b[A-Z]{2,4}\s?\d{3,4}\s?[A-Z]?\b",
+        r"(?:^|\n)([A-Z]{2,4}\s?\d{3,4})(?:\s|$)",
     ]
     plate = None
     for pattern in plate_patterns:
         match = re.search(pattern, t)
         if match:
             plate = match.group(0).strip()
-            # Clean up the plate
             plate = re.sub(r'\s+', '', plate)
             break
     
     # Enhanced expiry date pattern
-    # Matches: 16 SEP 2026, 16SEP2026, etc.
     expiry_patterns = [
         r"\b(\d{1,2})\s*(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s*(\d{4})\b",
         r"\b(\d{1,2})(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)(\d{4})\b"
@@ -131,12 +165,11 @@ def classify_jpj(text: str):
             expiry = f"{day.zfill(2)} {month} {year}"
             break
     
-    # Amount pattern (RM90.00, RM 90.00, etc.)
+    # Amount pattern
     amount_match = re.search(r"RM\s?(\d+(?:\.\d{2})?)", t)
     amount = f"RM{amount_match.group(1)}" if amount_match else None
     
     # Receipt/Reference codes
-    # VEL02504, 0014322, etc.
     receipt_patterns = [
         r"\bVEL\d{5,}\b",
         r"\b\d{7,}\b"
@@ -153,14 +186,14 @@ def classify_jpj(text: str):
     elif "SELAIN MOTOSIKAL" in t or "SELAIN MOTO" in t:
         vehicle_class = "SELAIN MOTOSIKAL"
     
-    # Location extraction (SEMENANJUNG, PERSENDIRIAN, etc.)
+    # Location extraction
     location = None
     if "SEMENANJUNG" in t:
         location = "SEMENANJUNG"
     elif "PERSENDIRIAN" in t:
         location = "PERSENDIRIAN"
     
-    # Build confidence score (more lenient)
+    # Build confidence score
     confidence = 0.0
     confidence += 0.3 if has_lesen or has_kenderaan else 0
     confidence += 0.3 if plate else 0
@@ -168,11 +201,9 @@ def classify_jpj(text: str):
     confidence += 0.1 if amount else 0
     confidence += 0.1 if vehicle_class else 0
     
-    # Lower threshold to 0.4 (was 0.6)
     if confidence < 0.4:
         return None
 
-    # Extract all numeric codes that might be useful
     numeric_codes = re.findall(r"\b\d{7,}\b", t)
     
     return {
@@ -184,14 +215,8 @@ def classify_jpj(text: str):
             "vehicle_class": vehicle_class,
             "amount": amount,
             "location": location,
-            "receipt_codes": receipts[:3] if receipts else None,  # Limit to top 3
+            "receipt_codes": receipts[:3] if receipts else None,
             "reference_numbers": numeric_codes[:3] if numeric_codes else None,
-            "raw_text_length": len(text)
-        },
-        "debug": {
-            "has_lesen": has_lesen,
-            "has_kenderaan": has_kenderaan,
-            "text_preview": text[:200] if len(text) > 200 else text
         }
     }
 
@@ -232,43 +257,89 @@ def fallback_form_extraction(text: str, quality: float):
 
 
 # -------------------------------------------------
-# API endpoint
+# API endpoint (async with timeout)
 # -------------------------------------------------
 @app.post("/ocr/document")
-def ocr_document(payload: dict):
+async def ocr_document(payload: dict):
     image_url = payload.get("image_url")
     if not image_url:
         raise HTTPException(status_code=400, detail="image_url required")
 
-    img = load_image_from_url(image_url)
-
-    # Try multiple OCR passes
-    raw_text = run_ocr(img)
-    enhanced_img = enhance_photo(img)
-    enhanced_text = run_ocr(enhanced_img)
-
-    raw_q = ocr_quality(raw_text)
-    enh_q = ocr_quality(enhanced_text)
-
-    text = enhanced_text if enh_q >= raw_q else raw_text
-    quality = max(raw_q, enh_q)
-
-    # Try JPJ classification on both versions
-    jpj = classify_jpj(enhanced_text)
-    if not jpj:
-        jpj = classify_jpj(raw_text)
+    print(f"Processing image: {image_url}")
     
-    if jpj:
-        jpj["ocr_quality"] = quality
-        jpj["method"] = "enhanced" if enh_q >= raw_q else "raw"
+    # Load image (with timeout and size limit)
+    try:
+        img = await asyncio.get_event_loop().run_in_executor(
+            executor,
+            partial(load_image_from_url, image_url)
+        )
+        print(f"Image loaded: {img.shape}")
+    except Exception as e:
+        print(f"Image load failed: {e}")
+        raise
+
+    # Strategy: Try raw first (faster), only enhance if needed
+    print("Running raw OCR...")
+    try:
+        raw_text = await asyncio.get_event_loop().run_in_executor(
+            executor,
+            partial(run_ocr, img, 30)
+        )
+        raw_q = ocr_quality(raw_text)
+        print(f"Raw OCR quality: {raw_q}")
+    except Exception as e:
+        print(f"Raw OCR failed: {e}")
+        raise
+
+    # Try classification on raw first
+    jpj = classify_jpj(raw_text)
+    if jpj and jpj['confidence'] > 0.6:
+        print("Document classified from raw OCR")
+        jpj["ocr_quality"] = raw_q
+        jpj["method"] = "raw"
         return jpj
 
+    # If raw wasn't confident enough, try enhanced
+    print("Raw OCR insufficient, trying enhanced...")
+    try:
+        enhanced_img = await asyncio.get_event_loop().run_in_executor(
+            executor,
+            partial(enhance_photo, img)
+        )
+        enhanced_text = await asyncio.get_event_loop().run_in_executor(
+            executor,
+            partial(run_ocr, enhanced_img, 30)
+        )
+        enh_q = ocr_quality(enhanced_text)
+        print(f"Enhanced OCR quality: {enh_q}")
+    except Exception as e:
+        print(f"Enhanced OCR failed: {e}")
+        # Fall back to raw results
+        return fallback_form_extraction(raw_text, raw_q)
+
+    # Try classification on enhanced
+    jpj = classify_jpj(enhanced_text)
+    if jpj:
+        print("Document classified from enhanced OCR")
+        jpj["ocr_quality"] = enh_q
+        jpj["method"] = "enhanced"
+        return jpj
+
+    # Use better of the two
+    text = enhanced_text if enh_q >= raw_q else raw_text
+    quality = max(raw_q, enh_q)
+    
+    print(f"No JPJ classification, falling back. Quality: {quality}")
     return fallback_form_extraction(text, quality)
 
 
 @app.get("/health")
 def health_check():
-    return {"status": "healthy", "version": "2.1.0"}
+    return {
+        "status": "healthy",
+        "version": "2.1.0",
+        "tesseract_version": pytesseract.get_tesseract_version()
+    }
 
 
 # -------------------------------------------------
@@ -282,3 +353,4 @@ def check_tesseract():
         print("WARNING: Malay language pack (msa) missing!")
     if "eng" not in langs:
         print("WARNING: English language pack missing!")
+    print("OCR service ready")
