@@ -6,8 +6,7 @@ import requests
 from PIL import Image, ImageOps
 from io import BytesIO
 import re
-import os
-import math
+from datetime import datetime
 
 # HEIC support (CRITICAL)
 import pillow_heif
@@ -15,7 +14,7 @@ pillow_heif.register_heif_opener()
 
 app = FastAPI(
     title="Smart OCR with Photo-First Pipeline (Malaysia)",
-    version="2.0.0"
+    version="2.1.0"
 )
 
 # -------------------------------------------------
@@ -91,45 +90,108 @@ def ocr_quality(text: str) -> float:
 
 
 # -------------------------------------------------
-# Malaysia JPJ classifier
+# Enhanced Malaysia JPJ classifier with better patterns
 # -------------------------------------------------
 def classify_jpj(text: str):
     t = text.upper()
-
-    if "LESEN" not in t and "KENDERAAN" not in t:
+    
+    # More flexible document identification
+    has_lesen = "LESEN" in t
+    has_kenderaan = "KENDERAAN" in t or "MOTOR" in t
+    
+    if not (has_lesen or has_kenderaan):
         return None
 
-    plate = re.search(r"\b[A-Z]{1,3}\d{1,4}[A-Z]?\b", t)
-    expiry = re.search(
-        r"\b\d{2}\s(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s\d{4}\b", t
-    )
-    amount = re.search(r"RM\s?\d+(?:\.\d{2})?", t)
-    receipt = re.search(r"\bVEL\d{5}\b", t)
-
+    # Enhanced plate number pattern (more flexible)
+    # Matches: WRU7352, WRU 7352, ABC1234, etc.
+    plate_patterns = [
+        r"\b[A-Z]{2,4}\s?\d{3,4}\s?[A-Z]?\b",  # Standard format
+        r"(?:^|\n)([A-Z]{2,4}\s?\d{3,4})(?:\s|$)",  # Line-based
+    ]
+    plate = None
+    for pattern in plate_patterns:
+        match = re.search(pattern, t)
+        if match:
+            plate = match.group(0).strip()
+            # Clean up the plate
+            plate = re.sub(r'\s+', '', plate)
+            break
+    
+    # Enhanced expiry date pattern
+    # Matches: 16 SEP 2026, 16SEP2026, etc.
+    expiry_patterns = [
+        r"\b(\d{1,2})\s*(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s*(\d{4})\b",
+        r"\b(\d{1,2})(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)(\d{4})\b"
+    ]
+    expiry = None
+    for pattern in expiry_patterns:
+        match = re.search(pattern, t)
+        if match:
+            day, month, year = match.groups()
+            expiry = f"{day.zfill(2)} {month} {year}"
+            break
+    
+    # Amount pattern (RM90.00, RM 90.00, etc.)
+    amount_match = re.search(r"RM\s?(\d+(?:\.\d{2})?)", t)
+    amount = f"RM{amount_match.group(1)}" if amount_match else None
+    
+    # Receipt/Reference codes
+    # VEL02504, 0014322, etc.
+    receipt_patterns = [
+        r"\bVEL\d{5,}\b",
+        r"\b\d{7,}\b"
+    ]
+    receipts = []
+    for pattern in receipt_patterns:
+        matches = re.findall(pattern, t)
+        receipts.extend(matches)
+    
+    # Vehicle class detection
     vehicle_class = None
-    if "MOTOSIKAL" in t:
+    if "MOTOSIKAL" in t and "SELAIN" not in t:
         vehicle_class = "MOTOSIKAL"
-    elif "SELAIN MOTOSIKAL" in t:
+    elif "SELAIN MOTOSIKAL" in t or "SELAIN MOTO" in t:
         vehicle_class = "SELAIN MOTOSIKAL"
-
+    
+    # Location extraction (SEMENANJUNG, PERSENDIRIAN, etc.)
+    location = None
+    if "SEMENANJUNG" in t:
+        location = "SEMENANJUNG"
+    elif "PERSENDIRIAN" in t:
+        location = "PERSENDIRIAN"
+    
+    # Build confidence score (more lenient)
     confidence = 0.0
-    confidence += 0.35 if plate else 0
-    confidence += 0.25 if expiry else 0
-    confidence += 0.2 if amount else 0
-    confidence += 0.2 if vehicle_class else 0
-
-    if confidence < 0.6:
+    confidence += 0.3 if has_lesen or has_kenderaan else 0
+    confidence += 0.3 if plate else 0
+    confidence += 0.2 if expiry else 0
+    confidence += 0.1 if amount else 0
+    confidence += 0.1 if vehicle_class else 0
+    
+    # Lower threshold to 0.4 (was 0.6)
+    if confidence < 0.4:
         return None
 
+    # Extract all numeric codes that might be useful
+    numeric_codes = re.findall(r"\b\d{7,}\b", t)
+    
     return {
         "document_type": "malaysia_roadtax_jpj",
         "confidence": round(confidence, 2),
         "fields": {
-            "plate_number": plate.group(0) if plate else None,
-            "expiry_date": expiry.group(0) if expiry else None,
+            "plate_number": plate,
+            "expiry_date": expiry,
             "vehicle_class": vehicle_class,
-            "amount": amount.group(0) if amount else None,
-            "receipt_code": receipt.group(0) if receipt else None
+            "amount": amount,
+            "location": location,
+            "receipt_codes": receipts[:3] if receipts else None,  # Limit to top 3
+            "reference_numbers": numeric_codes[:3] if numeric_codes else None,
+            "raw_text_length": len(text)
+        },
+        "debug": {
+            "has_lesen": has_lesen,
+            "has_kenderaan": has_kenderaan,
+            "text_preview": text[:200] if len(text) > 200 else text
         }
     }
 
@@ -138,12 +200,13 @@ def classify_jpj(text: str):
 # Safe fallback
 # -------------------------------------------------
 def fallback_form_extraction(text: str, quality: float):
-    if quality < 0.4:
+    if quality < 0.3:
         return {
             "document_type": "unreadable",
             "confidence": 0.0,
             "reason": "Photo quality too low for structured extraction",
-            "suggestion": "Retake photo with better lighting or closer framing"
+            "suggestion": "Retake photo with better lighting or closer framing",
+            "quality_score": quality
         }
 
     fields = {}
@@ -157,7 +220,8 @@ def fallback_form_extraction(text: str, quality: float):
         return {
             "document_type": "unknown_form",
             "confidence": round(quality, 2),
-            "note": "Text detected but structure unclear"
+            "note": "Text detected but structure unclear",
+            "text_preview": text[:300] if len(text) > 300 else text
         }
 
     return {
@@ -178,6 +242,7 @@ def ocr_document(payload: dict):
 
     img = load_image_from_url(image_url)
 
+    # Try multiple OCR passes
     raw_text = run_ocr(img)
     enhanced_img = enhance_photo(img)
     enhanced_text = run_ocr(enhanced_img)
@@ -188,11 +253,22 @@ def ocr_document(payload: dict):
     text = enhanced_text if enh_q >= raw_q else raw_text
     quality = max(raw_q, enh_q)
 
-    jpj = classify_jpj(text)
+    # Try JPJ classification on both versions
+    jpj = classify_jpj(enhanced_text)
+    if not jpj:
+        jpj = classify_jpj(raw_text)
+    
     if jpj:
+        jpj["ocr_quality"] = quality
+        jpj["method"] = "enhanced" if enh_q >= raw_q else "raw"
         return jpj
 
     return fallback_form_extraction(text, quality)
+
+
+@app.get("/health")
+def health_check():
+    return {"status": "healthy", "version": "2.1.0"}
 
 
 # -------------------------------------------------
@@ -204,3 +280,5 @@ def check_tesseract():
     print("Available Tesseract languages:", langs)
     if "msa" not in langs:
         print("WARNING: Malay language pack (msa) missing!")
+    if "eng" not in langs:
+        print("WARNING: English language pack missing!")
